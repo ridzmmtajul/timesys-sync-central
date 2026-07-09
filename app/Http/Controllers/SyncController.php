@@ -14,6 +14,7 @@ use App\Models\SyncLog;
 use App\Models\WorkSchedule;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 
 class SyncController extends Controller
@@ -21,7 +22,7 @@ class SyncController extends Controller
     // This project pushes local records that haven't been sent yet to the
     // timesys-v2 instance, which receives and upserts them.
 
-    public function pushEmployees()
+    public function pushEmployees(Request $request)
     {
         return $this->pushModule(
             Employee::class,
@@ -51,7 +52,8 @@ class SyncController extends Controller
             // receiving side (office, division, position, employment type),
             // so batches need to be smaller than the other modules to stay
             // under timesys-v2's execution time limit.
-            chunkSize: 25
+            chunkSize: 25,
+            syncedFrom: $request->input('synced_from')
         );
     }
 
@@ -88,7 +90,7 @@ class SyncController extends Controller
         );
     }
 
-    public function pushWorkSchedules()
+    public function pushWorkSchedules(Request $request)
     {
         return $this->pushModule(
             WorkSchedule::class,
@@ -113,11 +115,12 @@ class SyncController extends Controller
             // Each record also resolves schedule + schedule_type on the
             // receiving side, so this needs a smaller batch than the default
             // to stay under timesys-v2's execution time limit.
-            chunkSize: 40
+            chunkSize: 40,
+            syncedFrom: $request->input('synced_from')
         );
     }
 
-    public function pushAttendances()
+    public function pushAttendances(Request $request)
     {
         return $this->pushModule(
             Attendance::class,
@@ -134,7 +137,8 @@ class SyncController extends Controller
             // Attendance volumes are the largest of any module, and even
             // this lightweight per-record shape hits timesys-v2's execution
             // time limit past a few hundred rows in one request.
-            chunkSize: 50
+            chunkSize: 50,
+            syncedFrom: $request->input('synced_from')
         );
     }
 
@@ -164,7 +168,7 @@ class SyncController extends Controller
      * without ever getting a chance to sync anything. Batching keeps each
      * request fast and lets already-synced batches survive a later failure.
      */
-    private function pushModule(string $modelClass, $query, string $endpoint, string $payloadKey, callable $mapper, int $chunkSize = 500): JsonResponse
+    private function pushModule(string $modelClass, $query, string $endpoint, string $payloadKey, callable $mapper, int $chunkSize = 500, ?string $syncedFrom = null): JsonResponse
     {
         $targetUrl = config('services.sync.target_url');
         $apiKey    = config('services.sync.api_key');
@@ -200,14 +204,20 @@ class SyncController extends Controller
         // to pick up where this call left off.
         $deadline = microtime(true) + 20;
 
+        // Lets the receiver know when it has seen the last chunk of
+        // everything that was pending when this call started, so it can
+        // write a single aggregated sync_logs row instead of one per chunk.
+        $totalPending   = (clone $query)->count();
+        $processedSoFar = 0;
+
         // chunkById pulls one batch at a time from the database instead of
         // loading every pending record into memory up front, which matters
         // for attendances: tens of thousands of rows plus eager-loaded
         // relations can exhaust PHP's memory limit before a single request
         // is even sent.
         $query->chunkById($chunkSize, function ($chunk) use (
-            $modelClass, $endpoint, $payloadKey, $mapper, $targetUrl, $apiKey, $deadline,
-            &$synced, &$existing, &$skipped, &$errors, &$stoppedEarly, &$stopReason
+            $modelClass, $endpoint, $payloadKey, $mapper, $targetUrl, $apiKey, $deadline, $totalPending,
+            &$synced, &$existing, &$skipped, &$errors, &$stoppedEarly, &$stopReason, &$processedSoFar
         ) {
             if (microtime(true) >= $deadline) {
                 $stoppedEarly = true;
@@ -215,13 +225,16 @@ class SyncController extends Controller
                 return false;
             }
 
+            $processedSoFar += $chunk->count();
+            $isFinalChunk    = $processedSoFar >= $totalPending;
+
             $payload = $chunk->map($mapper)->values()->all();
 
             try {
                 [$response, $attempts] = $this->postWithRetry(
                     $apiKey,
                     rtrim($targetUrl, '/') . $endpoint,
-                    [$payloadKey => $payload]
+                    [$payloadKey => $payload, 'is_final_chunk' => $isFinalChunk, 'synced_from' => $syncedFrom]
                 );
             } catch (\Throwable $e) {
                 $errors[]     = "Batch of {$chunk->count()} {$payloadKey}: unable to reach timesys-v2.";
@@ -260,12 +273,24 @@ class SyncController extends Controller
             $message .= ' Stopped after a batch failure; remaining records will be retried on the next push.';
         }
 
-        $this->recordLog($payloadKey, 'push', $status, [
-            'total'    => $synced + $existing + $skipped,
-            'synced'   => $synced,
-            'existing' => $existing,
-            'skipped'  => $skipped,
-        ], $errors, $message);
+        // A large backlog (attendances especially) can take several
+        // time-budget-limited requests to fully push (see the frontend's
+        // pushModuleUntilDone loop). Only the last one of those requests is
+        // "final" from a logging standpoint.
+        $isFinal = !($stoppedEarly && $stopReason === 'time_budget');
+
+        $this->recordAggregatedLog(
+            $payloadKey, 'push', $isFinal, $status,
+            ['synced' => $synced, 'existing' => $existing, 'skipped' => $skipped],
+            $errors,
+            function (array $totals) use ($stopReason) {
+                $msg = "{$totals['synced']} synced, {$totals['existing']} existing, {$totals['skipped']} skipped.";
+                if ($stopReason === 'error') {
+                    $msg .= ' Stopped after a batch failure; remaining records will be retried on the next push.';
+                }
+                return $msg;
+            }
+        );
 
         return response()->json([
             'success'       => $status !== 'failed',
@@ -324,21 +349,23 @@ class SyncController extends Controller
         foreach ($employees as $data) {
             try {
                 $fullName = mb_strtolower(trim(($data['first_name'] ?? '') . '|' . ($data['middle_name'] ?? '') . '|' . ($data['last_name'] ?? '')));
+                $label    = "{$data['employee_no']} ({$data['first_name']} {$data['last_name']})";
 
                 if (in_array($data['employee_no'], $seenNos, true)) {
                     $skipped++;
-                    $errors[] = "Employee {$data['employee_no']}: duplicate employee_no in payload, skipped.";
+                    $errors[] = "Employee {$label}: duplicate employee_no in payload, skipped.";
                     continue;
                 }
 
                 if (in_array($fullName, $seenNames, true)) {
                     $skipped++;
-                    $errors[] = "Employee {$data['employee_no']}: duplicate full name in payload, skipped.";
+                    $errors[] = "Employee {$label}: duplicate full name in payload, skipped.";
                     continue;
                 }
 
                 if (Employee::where('employee_no', $data['employee_no'])->exists()) {
                     $existing++;
+                    $errors[] = "Employee {$label}: already exists (matched by employee number).";
                     continue;
                 }
 
@@ -347,6 +374,7 @@ class SyncController extends Controller
                     ->where('last_name', $data['last_name'] ?? null)
                     ->exists()) {
                     $existing++;
+                    $errors[] = "Employee {$label}: already exists (matched by name).";
                     continue;
                 }
 
@@ -357,7 +385,7 @@ class SyncController extends Controller
 
                 if (!$officeId) {
                     $skipped++;
-                    $errors[] = "Employee {$data['employee_no']}: office name is missing, skipped.";
+                    $errors[] = "Employee {$label}: office name is missing, skipped.";
                     continue;
                 }
 
@@ -382,11 +410,11 @@ class SyncController extends Controller
                 $synced++;
             } catch (\Throwable $e) {
                 $skipped++;
-                $errors[] = "Employee {$data['employee_no']}: {$e->getMessage()}";
+                $errors[] = "Employee " . ($label ?? $data['employee_no'] ?? '?') . ": {$e->getMessage()}";
             }
         }
 
-        return $this->respondReceive('employees', $synced, $existing, $skipped, $errors, 'employee(s)');
+        return $this->respondReceive('employees', $synced, $existing, $skipped, $errors, 'employee(s)', $request->boolean('is_final_chunk', true));
     }
 
     public function receiveOffices(Request $request)
@@ -429,7 +457,7 @@ class SyncController extends Controller
             }
         }
 
-        return $this->respondReceive('offices', $synced, $existing, $skipped, $errors, 'office(s)');
+        return $this->respondReceive('offices', $synced, $existing, $skipped, $errors, 'office(s)', $request->boolean('is_final_chunk', true));
     }
 
     public function receiveOfficeDivisions(Request $request)
@@ -476,7 +504,7 @@ class SyncController extends Controller
             }
         }
 
-        return $this->respondReceive('office_divisions', $synced, $existing, $skipped, $errors, 'division(s)');
+        return $this->respondReceive('office_divisions', $synced, $existing, $skipped, $errors, 'division(s)', $request->boolean('is_final_chunk', true));
     }
 
     public function receiveWorkSchedules(Request $request)
@@ -531,7 +559,7 @@ class SyncController extends Controller
             }
         }
 
-        return $this->respondReceive('work_schedules', $synced, $existing, $skipped, $errors, 'work schedule(s)');
+        return $this->respondReceive('work_schedules', $synced, $existing, $skipped, $errors, 'work schedule(s)', $request->boolean('is_final_chunk', true));
     }
 
     public function receiveAttendances(Request $request)
@@ -579,7 +607,7 @@ class SyncController extends Controller
             }
         }
 
-        return $this->respondReceive('attendances', $synced, $existing, $skipped, $errors, 'attendance record(s)');
+        return $this->respondReceive('attendances', $synced, $existing, $skipped, $errors, 'attendance record(s)', $request->boolean('is_final_chunk', true));
     }
 
     // ── DASHBOARD DATA (public, no login) ───────────────────────────────────
@@ -608,21 +636,24 @@ class SyncController extends Controller
 
     // ── HELPERS ──────────────────────────────────────────────────────────────
 
-    private function respondReceive(string $module, int $synced, int $existing, int $skipped, array $errors, string $label): JsonResponse
+    private function respondReceive(string $module, int $synced, int $existing, int $skipped, array $errors, string $label, bool $isFinal = true): JsonResponse
     {
+        // $errors can also carry informational notes (e.g. "employee already
+        // exists") that aren't real problems, so status is driven by
+        // $skipped rather than by $errors being non-empty.
         $status = 'success';
-        if (!empty($errors)) {
+        if ($skipped > 0) {
             $status = ($synced > 0 || $existing > 0) ? 'partial' : 'failed';
         }
 
         $message = "{$synced} {$label} synced, {$existing} already exist, {$skipped} skipped.";
 
-        $this->recordLog($module, 'receive', $status, [
-            'total'    => $synced + $existing + $skipped,
-            'synced'   => $synced,
-            'existing' => $existing,
-            'skipped'  => $skipped,
-        ], $errors, $message);
+        $this->recordAggregatedLog(
+            $module, 'receive', $isFinal, $status,
+            ['synced' => $synced, 'existing' => $existing, 'skipped' => $skipped],
+            $errors,
+            fn (array $totals) => "{$totals['synced']} {$label} synced, {$totals['existing']} already exist, {$totals['skipped']} skipped."
+        );
 
         return response()->json([
             'success'  => $status !== 'failed',
@@ -647,6 +678,39 @@ class SyncController extends Controller
             'errors'         => $errors,
             'message'        => $message,
         ]);
+    }
+
+    /**
+     * A push of one module can span several chunked requests — either
+     * several chunk-POSTs within a single pushModule() call, or several
+     * browser calls once the per-request time budget is hit (see
+     * pushModule). Rather than writing a sync_logs row per chunk, this
+     * accumulates each chunk's counts/errors in cache and only writes the
+     * row once the caller says the whole run is finished ($isFinal), so one
+     * logical sync produces exactly one log entry.
+     */
+    private function recordAggregatedLog(string $module, string $direction, bool $isFinal, string $status, array $counts, array $errors, \Closure $messageBuilder): void
+    {
+        $key      = "sync_progress:{$direction}:{$module}";
+        $progress = Cache::get($key, ['synced' => 0, 'existing' => 0, 'skipped' => 0, 'errors' => []]);
+        $progress['synced']   += $counts['synced'] ?? 0;
+        $progress['existing'] += $counts['existing'] ?? 0;
+        $progress['skipped']  += $counts['skipped'] ?? 0;
+        $progress['errors']    = array_merge($progress['errors'], $errors);
+
+        if (!$isFinal) {
+            Cache::put($key, $progress, now()->addHour());
+            return;
+        }
+
+        Cache::forget($key);
+
+        $this->recordLog($module, $direction, $status, [
+            'total'    => $progress['synced'] + $progress['existing'] + $progress['skipped'],
+            'synced'   => $progress['synced'],
+            'existing' => $progress['existing'],
+            'skipped'  => $progress['skipped'],
+        ], $progress['errors'], $messageBuilder($progress));
     }
 
     private function resolveOffice(?string $name, ?string $code): ?int
