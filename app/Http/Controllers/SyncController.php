@@ -26,13 +26,12 @@ class SyncController extends Controller
     {
         return $this->pushModule(
             Employee::class,
-            // withTrashed(): without it, Eloquent's default SoftDeletingScope
-            // would silently exclude an employee soft-deleted before ever
-            // being synced — they'd never reach timesys-v2 at all, and any
-            // work schedule/attendance referencing them would then fail for
-            // real (unlike the trashed-but-already-synced case those two
-            // modules now handle via employee_is_active).
-            Employee::withTrashed()->whereNull('synced_at')->with(['office', 'employmentType', 'position', 'officeDivision']),
+            // No withTrashed() here: a soft-deleted employee (deleted_at set)
+            // must never be pushed to timesys-v2. Eloquent's default
+            // SoftDeletingScope excludes them from this query, and the same
+            // default scope applies in pendingCounts(), so they simply never
+            // count as pending rather than getting stuck.
+            Employee::whereNull('synced_at')->with(['office', 'employmentType', 'position', 'officeDivision']),
             '/api/sync/receive-employees',
             'employees',
             fn ($emp) => [
@@ -44,9 +43,7 @@ class SyncController extends Controller
                 'gender'               => $emp->gender,
                 'contact_no'           => $emp->contact_no,
                 'job_title'            => $emp->job_title,
-                // A deleted-before-first-sync employee should still be
-                // created on the receiving side, just already inactive.
-                'is_active'            => $emp->is_active && !$emp->trashed(),
+                'is_active'            => $emp->is_active,
                 'image'                => $emp->image,
                 'signature'            => $emp->signature,
                 'office_name'          => $emp->office?->name,
