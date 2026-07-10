@@ -16,6 +16,7 @@ Route::middleware('sync.api_key')->group(function () {
 Route::get('/sync/counts', [SyncController::class, 'counts']);
 Route::get('/sync/logs', [SyncController::class, 'logs']);
 Route::get('/sync/pending-counts', [SyncController::class, 'pendingCounts']);
+Route::get('/sync/biometric-locations', [SyncController::class, 'biometricLocations']);
 
 // Push triggers — called from this project's own dashboard button
 Route::post('/sync/push-employees', [SyncController::class, 'pushEmployees']);

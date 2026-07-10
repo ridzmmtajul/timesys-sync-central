@@ -162,6 +162,50 @@
             outline: none;
             border-color: rgba(126, 153, 210, 0.7);
         }
+        .office-name-input:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        .office-name-error {
+            color: #ff6b6b;
+            font-size: 12px;
+            margin: 8px 0 0;
+            display: none;
+        }
+        .combobox {
+            position: relative;
+        }
+        .combobox-list {
+            display: none;
+            position: absolute;
+            top: calc(100% + 4px);
+            left: 0;
+            right: 0;
+            max-height: 220px;
+            overflow-y: auto;
+            background: rgba(17, 27, 56, 0.97);
+            border: 1px solid rgba(126, 153, 210, 0.3);
+            border-radius: 10px;
+            z-index: 20;
+        }
+        .combobox-list.is-open {
+            display: block;
+        }
+        .combobox-option {
+            padding: 8px 12px;
+            font-size: 14px;
+            color: #eef6ff;
+            cursor: pointer;
+        }
+        .combobox-option:hover,
+        .combobox-option.is-active {
+            background: rgba(126, 153, 210, 0.2);
+        }
+        .combobox-empty {
+            padding: 8px 12px;
+            font-size: 13px;
+            color: #9bb0da;
+        }
         .modal-footer {
             display: flex;
             justify-content: flex-end;
@@ -296,10 +340,15 @@
                 <h2>Push All</h2>
                 <button class="modal-close" onclick="closePushModal()">&times;</button>
             </div>
-            <p class="push-result" style="margin-bottom:10px;">Enter the office name this push is coming from. It will be saved on every new record synced to timesys-v2.</p>
-            <input type="text" id="office-name-input" class="office-name-input" placeholder="e.g. Main Office" autocomplete="off" onkeydown="if (event.key === 'Enter') confirmPushModal()">
+            <p class="push-result" style="margin-bottom:10px;">Select the biometric location this push is coming from. It will be saved on every new record synced to timesys-v2.</p>
+            <div class="combobox" id="office-combobox">
+                <input type="text" id="office-search-input" class="office-name-input" placeholder="Loading locations…" autocomplete="off" disabled>
+                <input type="hidden" id="office-name-input">
+                <div class="combobox-list" id="office-combobox-list"></div>
+            </div>
+            <p class="office-name-error" id="office-name-error"></p>
             <div class="modal-footer">
-                <button class="btn-push" onclick="confirmPushModal()">Push</button>
+                <button class="btn-push" id="push-modal-confirm-btn" onclick="confirmPushModal()" disabled>Push</button>
             </div>
         </div>
     </div>
@@ -350,21 +399,148 @@
             document.getElementById('details-modal').classList.remove('is-open');
         }
 
-        function openPushModal() {
-            const input = document.getElementById('office-name-input');
-            input.value = '';
+        let biometricLocations  = [];
+        let comboActiveIndex    = -1;
+
+        function renderComboboxOptions(items) {
+            const list = document.getElementById('office-combobox-list');
+            comboActiveIndex = -1;
+
+            if (items.length === 0) {
+                list.innerHTML = '<div class="combobox-empty">No matching locations</div>';
+                return;
+            }
+
+            list.innerHTML = items
+                .map(name => `<div class="combobox-option" data-value="${escapeHtml(name)}">${escapeHtml(name)}</div>`)
+                .join('');
+        }
+
+        function openComboboxList() {
+            document.getElementById('office-combobox-list').classList.add('is-open');
+        }
+
+        function closeComboboxList() {
+            document.getElementById('office-combobox-list').classList.remove('is-open');
+            comboActiveIndex = -1;
+        }
+
+        function selectBiometricLocation(name) {
+            document.getElementById('office-search-input').value = name;
+            document.getElementById('office-name-input').value = name;
+            document.getElementById('push-modal-confirm-btn').disabled = false;
+            closeComboboxList();
+        }
+
+        function filterBiometricLocations() {
+            const query = document.getElementById('office-search-input').value.trim().toLowerCase();
+
+            // Typing invalidates whatever was previously selected - the value
+            // is only set again once an option is actually clicked/confirmed,
+            // so a half-typed search can't be submitted as if it were a pick.
+            document.getElementById('office-name-input').value = '';
+            document.getElementById('push-modal-confirm-btn').disabled = true;
+
+            const matches = query
+                ? biometricLocations.filter(name => name.toLowerCase().includes(query))
+                : biometricLocations;
+
+            renderComboboxOptions(matches);
+            openComboboxList();
+        }
+
+        function moveComboboxActive(delta) {
+            const options = Array.from(document.querySelectorAll('#office-combobox-list .combobox-option'));
+            if (options.length === 0) return;
+
+            options[comboActiveIndex]?.classList.remove('is-active');
+            comboActiveIndex = (comboActiveIndex + delta + options.length) % options.length;
+            options[comboActiveIndex].classList.add('is-active');
+            options[comboActiveIndex].scrollIntoView({ block: 'nearest' });
+        }
+
+        function confirmComboboxActive() {
+            const options = document.querySelectorAll('#office-combobox-list .combobox-option');
+            const chosen  = options[comboActiveIndex] ?? options[0];
+            if (chosen) {
+                selectBiometricLocation(chosen.dataset.value);
+            }
+        }
+
+        document.getElementById('office-combobox-list').addEventListener('click', (event) => {
+            const option = event.target.closest('.combobox-option');
+            if (option) {
+                selectBiometricLocation(option.dataset.value);
+            }
+        });
+
+        document.getElementById('office-search-input').addEventListener('input', filterBiometricLocations);
+        document.getElementById('office-search-input').addEventListener('focus', () => {
+            if (!document.getElementById('office-search-input').disabled) {
+                filterBiometricLocations();
+            }
+        });
+        document.getElementById('office-search-input').addEventListener('keydown', (event) => {
+            if (event.key === 'ArrowDown') { event.preventDefault(); openComboboxList(); moveComboboxActive(1); }
+            else if (event.key === 'ArrowUp') { event.preventDefault(); openComboboxList(); moveComboboxActive(-1); }
+            else if (event.key === 'Enter') { event.preventDefault(); confirmComboboxActive(); }
+            else if (event.key === 'Escape') { closeComboboxList(); }
+        });
+        document.addEventListener('click', (event) => {
+            if (!document.getElementById('office-combobox').contains(event.target)) {
+                closeComboboxList();
+            }
+        });
+
+        async function openPushModal() {
+            const searchInput = document.getElementById('office-search-input');
+            const valueInput  = document.getElementById('office-name-input');
+            const errorEl     = document.getElementById('office-name-error');
+            const pushBtn     = document.getElementById('push-modal-confirm-btn');
+
+            searchInput.value     = '';
+            searchInput.disabled  = true;
+            searchInput.placeholder = 'Loading locations…';
+            valueInput.value     = '';
+            pushBtn.disabled      = true;
+            errorEl.style.display = 'none';
+            closeComboboxList();
+
             document.getElementById('push-office-modal').classList.add('is-open');
-            input.focus();
+
+            try {
+                const res  = await fetch('/api/sync/biometric-locations');
+                const data = await res.json();
+
+                if (!res.ok || data.success === false || !Array.isArray(data.data)) {
+                    throw new Error(data.message || 'Failed to load biometric locations.');
+                }
+
+                if (data.data.length === 0) {
+                    throw new Error('No biometric locations are configured on timesys-v2 yet.');
+                }
+
+                biometricLocations = data.data;
+                searchInput.disabled = false;
+                searchInput.placeholder = 'Search location…';
+                searchInput.focus();
+            } catch (err) {
+                biometricLocations = [];
+                searchInput.placeholder = 'Unavailable';
+                errorEl.textContent = `${err.message} Close this dialog and try again.`;
+                errorEl.style.display = 'block';
+            }
         }
 
         function closePushModal() {
             document.getElementById('push-office-modal').classList.remove('is-open');
+            closeComboboxList();
         }
 
         function confirmPushModal() {
             const officeName = document.getElementById('office-name-input').value.trim();
             if (!officeName) {
-                alert('Please enter an office name.');
+                alert('Please select a biometric location from the list.');
                 return;
             }
             closePushModal();

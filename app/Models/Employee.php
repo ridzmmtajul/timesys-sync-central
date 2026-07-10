@@ -33,6 +33,19 @@ class Employee extends Model
         'is_active' => 'boolean',
     ];
 
+    protected static function booted()
+    {
+        // A soft-deleted employee must never read back as active — enforced
+        // here rather than left to callers, since deleted_at and is_active
+        // are otherwise two independently-settable columns that can drift.
+        static::deleting(function (Employee $employee) {
+            if (!$employee->isForceDeleting() && $employee->is_active) {
+                $employee->is_active = false;
+                $employee->saveQuietly();
+            }
+        });
+    }
+
     public function office()
     {
         return $this->belongsTo(Office::class);

@@ -26,7 +26,13 @@ class SyncController extends Controller
     {
         return $this->pushModule(
             Employee::class,
-            Employee::whereNull('synced_at')->with(['office', 'employmentType', 'position', 'officeDivision']),
+            // withTrashed(): without it, Eloquent's default SoftDeletingScope
+            // would silently exclude an employee soft-deleted before ever
+            // being synced — they'd never reach timesys-v2 at all, and any
+            // work schedule/attendance referencing them would then fail for
+            // real (unlike the trashed-but-already-synced case those two
+            // modules now handle via employee_is_active).
+            Employee::withTrashed()->whereNull('synced_at')->with(['office', 'employmentType', 'position', 'officeDivision']),
             '/api/sync/receive-employees',
             'employees',
             fn ($emp) => [
@@ -38,7 +44,9 @@ class SyncController extends Controller
                 'gender'               => $emp->gender,
                 'contact_no'           => $emp->contact_no,
                 'job_title'            => $emp->job_title,
-                'is_active'            => $emp->is_active,
+                // A deleted-before-first-sync employee should still be
+                // created on the receiving side, just already inactive.
+                'is_active'            => $emp->is_active && !$emp->trashed(),
                 'image'                => $emp->image,
                 'signature'            => $emp->signature,
                 'office_name'          => $emp->office?->name,
@@ -94,11 +102,25 @@ class SyncController extends Controller
     {
         return $this->pushModule(
             WorkSchedule::class,
-            WorkSchedule::whereNull('synced_at')->with(['employee', 'schedule', 'scheduleType']),
+            // Eager-loading 'employee' would otherwise silently return null
+            // for a soft-deleted employee (Eloquent's default scope excludes
+            // trashed rows from relations), sending employee_no as null and
+            // making the record look unmatchable on the receiving side even
+            // though the employee genuinely exists there.
+            WorkSchedule::whereNull('synced_at')->with(['employee' => fn ($q) => $q->withTrashed(), 'schedule', 'scheduleType']),
             '/api/sync/receive-work-schedules',
             'work_schedules',
             fn ($ws) => [
+                // Round-tripped back in error messages so a failure can be
+                // looked up directly by primary key on this (pushing) side —
+                // employee_no/name alone can't disambiguate when the same
+                // employee has multiple work schedule rows.
+                'source_id'          => $ws->id,
                 'employee_no'        => $ws->employee?->employee_no,
+                'employee_name'      => trim($ws->employee?->first_name . ' ' . $ws->employee?->last_name),
+                // A deleted employee here should still land on the receiving
+                // side, just flagged inactive rather than rejected outright.
+                'employee_is_active' => $ws->employee ? ($ws->employee->is_active && !$ws->employee->trashed()) : null,
                 'schedule_name'      => $ws->schedule?->name,
                 'schedule_type_name' => $ws->scheduleType?->name,
                 'timein_AM'          => $ws->timein_AM,
@@ -124,11 +146,14 @@ class SyncController extends Controller
     {
         return $this->pushModule(
             Attendance::class,
-            Attendance::whereNull('synced_at')->with(['employee']),
+            // See pushWorkSchedules: withTrashed() keeps a soft-deleted
+            // employee's employee_no from being silently nulled out.
+            Attendance::whereNull('synced_at')->with(['employee' => fn ($q) => $q->withTrashed()]),
             '/api/sync/receive-attendances',
             'attendances',
             fn ($att) => [
-                'employee_no' => $att->employee?->employee_no,
+                'employee_no'         => $att->employee?->employee_no,
+                'employee_is_active'  => $att->employee ? ($att->employee->is_active && !$att->employee->trashed()) : null,
                 'check_time'  => optional($att->check_time)->format('Y-m-d H:i:s'),
                 'serial_no'   => $att->serial_no,
                 'post_no'     => $att->post_no,
@@ -150,6 +175,46 @@ class SyncController extends Controller
             'office_divisions' => OfficeDivision::whereNull('synced_at')->count(),
             'work_schedules'   => WorkSchedule::whereNull('synced_at')->count(),
             'attendances'      => Attendance::whereNull('synced_at')->count(),
+        ]);
+    }
+
+    /**
+     * Proxies timesys-v2's canonical biometric location list so the "Push
+     * All" modal can offer a dropdown instead of a free-text field - a typo'd
+     * value here becomes a new synced_from, which timesys-v2 uses to scope
+     * employee_no uniqueness (see employee_offices on that side).
+     */
+    public function biometricLocations(): JsonResponse
+    {
+        $targetUrl = config('services.sync.target_url');
+        $apiKey    = config('services.sync.api_key');
+
+        if (!$targetUrl || !$apiKey) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Sync not configured. Set SYNC_TARGET_URL and SYNC_API_KEY in .env.',
+            ], 500);
+        }
+
+        try {
+            $response = Http::withToken($apiKey)->timeout(15)->get(rtrim($targetUrl, '/') . '/api/sync/biometric-locations');
+        } catch (\Throwable $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Unable to reach timesys-v2.',
+            ], 502);
+        }
+
+        if ($response->failed()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'timesys-v2 returned an error.',
+            ], 502);
+        }
+
+        return response()->json([
+            'success' => true,
+            'data'    => $response->json('data', []),
         ]);
     }
 
@@ -202,6 +267,14 @@ class SyncController extends Controller
         // stop pulling new chunks once this budget is spent and return a
         // normal partial response — the caller is expected to push again
         // to pick up where this call left off.
+        //
+        // The 20s check only runs between chunks, so a single slow/retried
+        // postWithRetry() call (up to 120s per attempt) can still outlast
+        // PHP's own max_execution_time and get the whole request fatally
+        // killed before that check ever runs again. Raise the hard limit
+        // well above the soft deadline so an in-flight chunk always has
+        // room to finish (or genuinely fail) before PHP steps in.
+        set_time_limit(180);
         $deadline = microtime(true) + 20;
 
         // Lets the receiver know when it has seen the last chunk of
@@ -216,7 +289,7 @@ class SyncController extends Controller
         // relations can exhaust PHP's memory limit before a single request
         // is even sent.
         $query->chunkById($chunkSize, function ($chunk) use (
-            $modelClass, $endpoint, $payloadKey, $mapper, $targetUrl, $apiKey, $deadline, $totalPending,
+            $modelClass, $endpoint, $payloadKey, $mapper, $targetUrl, $apiKey, $deadline, $totalPending, $syncedFrom,
             &$synced, &$existing, &$skipped, &$errors, &$stoppedEarly, &$stopReason, &$processedSoFar
         ) {
             if (microtime(true) >= $deadline) {
@@ -237,6 +310,12 @@ class SyncController extends Controller
                     [$payloadKey => $payload, 'is_final_chunk' => $isFinalChunk, 'synced_from' => $syncedFrom]
                 );
             } catch (\Throwable $e) {
+                \Illuminate\Support\Facades\Log::warning("Sync push to timesys-v2 failed for {$payloadKey}", [
+                    'endpoint'   => $endpoint,
+                    'chunk_size' => $chunk->count(),
+                    'exception'  => get_class($e),
+                    'message'    => $e->getMessage(),
+                ]);
                 $errors[]     = "Batch of {$chunk->count()} {$payloadKey}: unable to reach timesys-v2.";
                 $stoppedEarly = true;
                 $stopReason   = 'error';
@@ -253,6 +332,11 @@ class SyncController extends Controller
 
             $result = $response->json();
 
+            // Records the receiver skipped (e.g. a work schedule whose
+            // employee hasn't synced yet) still get stamped synced_at here,
+            // same as everything else in the chunk — a skip is treated as a
+            // resolved attempt rather than something to keep silently
+            // retrying on every future push.
             $modelClass::whereIn('id', $chunk->pluck('id'))->update(['synced_at' => now()]);
 
             $synced   += $result['synced'] ?? 0;
@@ -338,27 +422,30 @@ class SyncController extends Controller
 
     public function receiveEmployees(Request $request)
     {
-        $employees = $request->input('employees', []);
-        $synced    = 0;
-        $skipped   = 0;
-        $existing  = 0;
-        $errors    = [];
-        $seenNos   = [];
-        $seenNames = [];
+        $employees      = $request->input('employees', []);
+        $synced         = 0;
+        $skipped        = 0;
+        $existing       = 0;
+        $errors         = [];
+        $seenNos        = [];
+        $seenNames      = [];
+        $skippedIndexes = [];
 
-        foreach ($employees as $data) {
+        foreach ($employees as $idx => $data) {
             try {
                 $fullName = mb_strtolower(trim(($data['first_name'] ?? '') . '|' . ($data['middle_name'] ?? '') . '|' . ($data['last_name'] ?? '')));
                 $label    = "{$data['employee_no']} ({$data['first_name']} {$data['last_name']})";
 
                 if (in_array($data['employee_no'], $seenNos, true)) {
                     $skipped++;
+                    $skippedIndexes[] = $idx;
                     $errors[] = "Employee {$label}: duplicate employee_no in payload, skipped.";
                     continue;
                 }
 
                 if (in_array($fullName, $seenNames, true)) {
                     $skipped++;
+                    $skippedIndexes[] = $idx;
                     $errors[] = "Employee {$label}: duplicate full name in payload, skipped.";
                     continue;
                 }
@@ -385,6 +472,7 @@ class SyncController extends Controller
 
                 if (!$officeId) {
                     $skipped++;
+                    $skippedIndexes[] = $idx;
                     $errors[] = "Employee {$label}: office name is missing, skipped.";
                     continue;
                 }
@@ -410,25 +498,28 @@ class SyncController extends Controller
                 $synced++;
             } catch (\Throwable $e) {
                 $skipped++;
+                $skippedIndexes[] = $idx;
                 $errors[] = "Employee " . ($label ?? $data['employee_no'] ?? '?') . ": {$e->getMessage()}";
             }
         }
 
-        return $this->respondReceive('employees', $synced, $existing, $skipped, $errors, 'employee(s)', $request->boolean('is_final_chunk', true));
+        return $this->respondReceive('employees', $synced, $existing, $skipped, $errors, 'employee(s)', $request->boolean('is_final_chunk', true), $skippedIndexes);
     }
 
     public function receiveOffices(Request $request)
     {
-        $offices  = $request->input('offices', []);
-        $synced   = 0;
-        $existing = 0;
-        $skipped  = 0;
-        $errors   = [];
+        $offices        = $request->input('offices', []);
+        $synced         = 0;
+        $existing       = 0;
+        $skipped        = 0;
+        $errors         = [];
+        $skippedIndexes = [];
 
-        foreach ($offices as $data) {
+        foreach ($offices as $idx => $data) {
             try {
                 if (empty($data['code']) && empty($data['name'])) {
                     $skipped++;
+                    $skippedIndexes[] = $idx;
                     $errors[] = 'Office is missing code and name, skipped.';
                     continue;
                 }
@@ -453,27 +544,30 @@ class SyncController extends Controller
                 $synced++;
             } catch (\Throwable $e) {
                 $skipped++;
+                $skippedIndexes[] = $idx;
                 $errors[] = "Office {$data['code']}: {$e->getMessage()}";
             }
         }
 
-        return $this->respondReceive('offices', $synced, $existing, $skipped, $errors, 'office(s)', $request->boolean('is_final_chunk', true));
+        return $this->respondReceive('offices', $synced, $existing, $skipped, $errors, 'office(s)', $request->boolean('is_final_chunk', true), $skippedIndexes);
     }
 
     public function receiveOfficeDivisions(Request $request)
     {
-        $divisions = $request->input('office_divisions', []);
-        $synced    = 0;
-        $existing  = 0;
-        $skipped   = 0;
-        $errors    = [];
+        $divisions      = $request->input('office_divisions', []);
+        $synced         = 0;
+        $existing       = 0;
+        $skipped        = 0;
+        $errors         = [];
+        $skippedIndexes = [];
 
-        foreach ($divisions as $data) {
+        foreach ($divisions as $idx => $data) {
             try {
                 $officeId = $this->resolveOffice($data['office_name'] ?? null, $data['office_code'] ?? null);
 
                 if (!$officeId) {
                     $skipped++;
+                    $skippedIndexes[] = $idx;
                     $errors[] = "Division {$data['name']}: office is missing, skipped.";
                     continue;
                 }
@@ -500,28 +594,33 @@ class SyncController extends Controller
                 $synced++;
             } catch (\Throwable $e) {
                 $skipped++;
+                $skippedIndexes[] = $idx;
                 $errors[] = "Division {$data['name']}: {$e->getMessage()}";
             }
         }
 
-        return $this->respondReceive('office_divisions', $synced, $existing, $skipped, $errors, 'division(s)', $request->boolean('is_final_chunk', true));
+        return $this->respondReceive('office_divisions', $synced, $existing, $skipped, $errors, 'division(s)', $request->boolean('is_final_chunk', true), $skippedIndexes);
     }
 
     public function receiveWorkSchedules(Request $request)
     {
-        $items    = $request->input('work_schedules', []);
-        $synced   = 0;
-        $existing = 0;
-        $skipped  = 0;
-        $errors   = [];
+        $items          = $request->input('work_schedules', []);
+        $synced         = 0;
+        $existing       = 0;
+        $skipped        = 0;
+        $errors         = [];
+        $skippedIndexes = [];
 
-        foreach ($items as $data) {
+        foreach ($items as $idx => $data) {
             try {
                 $employeeId = Employee::where('employee_no', $data['employee_no'] ?? null)->value('id');
 
                 if (!$employeeId) {
                     $skipped++;
-                    $errors[] = "Work schedule: employee {$data['employee_no']} not found on central server, skipped.";
+                    $skippedIndexes[] = $idx;
+                    $label    = trim(($data['employee_no'] ?? 'unknown no.') . ' (' . ($data['employee_name'] ?? 'unknown name') . ')');
+                    $sourceId = $data['source_id'] ?? '?';
+                    $errors[] = "Work schedule (id {$sourceId} on source): employee {$label} not found on central server, skipped.";
                     continue;
                 }
 
@@ -555,27 +654,30 @@ class SyncController extends Controller
                 $synced++;
             } catch (\Throwable $e) {
                 $skipped++;
-                $errors[] = "Work schedule for {$data['employee_no']}: {$e->getMessage()}";
+                $skippedIndexes[] = $idx;
+                $errors[] = "Work schedule (id " . ($data['source_id'] ?? '?') . " on source) for {$data['employee_no']}: {$e->getMessage()}";
             }
         }
 
-        return $this->respondReceive('work_schedules', $synced, $existing, $skipped, $errors, 'work schedule(s)', $request->boolean('is_final_chunk', true));
+        return $this->respondReceive('work_schedules', $synced, $existing, $skipped, $errors, 'work schedule(s)', $request->boolean('is_final_chunk', true), $skippedIndexes);
     }
 
     public function receiveAttendances(Request $request)
     {
-        $items    = $request->input('attendances', []);
-        $synced   = 0;
-        $existing = 0;
-        $skipped  = 0;
-        $errors   = [];
+        $items          = $request->input('attendances', []);
+        $synced         = 0;
+        $existing       = 0;
+        $skipped        = 0;
+        $errors         = [];
+        $skippedIndexes = [];
 
-        foreach ($items as $data) {
+        foreach ($items as $idx => $data) {
             try {
                 $employeeId = Employee::where('employee_no', $data['employee_no'] ?? null)->value('id');
 
                 if (!$employeeId) {
                     $skipped++;
+                    $skippedIndexes[] = $idx;
                     $errors[] = "Attendance: employee {$data['employee_no']} not found on central server, skipped.";
                     continue;
                 }
@@ -603,11 +705,12 @@ class SyncController extends Controller
                 $synced++;
             } catch (\Throwable $e) {
                 $skipped++;
+                $skippedIndexes[] = $idx;
                 $errors[] = "Attendance for {$data['employee_no']}: {$e->getMessage()}";
             }
         }
 
-        return $this->respondReceive('attendances', $synced, $existing, $skipped, $errors, 'attendance record(s)', $request->boolean('is_final_chunk', true));
+        return $this->respondReceive('attendances', $synced, $existing, $skipped, $errors, 'attendance record(s)', $request->boolean('is_final_chunk', true), $skippedIndexes);
     }
 
     // ── DASHBOARD DATA (public, no login) ───────────────────────────────────
@@ -636,7 +739,7 @@ class SyncController extends Controller
 
     // ── HELPERS ──────────────────────────────────────────────────────────────
 
-    private function respondReceive(string $module, int $synced, int $existing, int $skipped, array $errors, string $label, bool $isFinal = true): JsonResponse
+    private function respondReceive(string $module, int $synced, int $existing, int $skipped, array $errors, string $label, bool $isFinal = true, array $skippedIndexes = []): JsonResponse
     {
         // $errors can also carry informational notes (e.g. "employee already
         // exists") that aren't real problems, so status is driven by
@@ -656,12 +759,13 @@ class SyncController extends Controller
         );
 
         return response()->json([
-            'success'  => $status !== 'failed',
-            'synced'   => $synced,
-            'existing' => $existing,
-            'skipped'  => $skipped,
-            'message'  => $message,
-            'errors'   => $errors,
+            'success'         => $status !== 'failed',
+            'synced'          => $synced,
+            'existing'        => $existing,
+            'skipped'         => $skipped,
+            'message'         => $message,
+            'errors'          => $errors,
+            'skipped_indexes' => $skippedIndexes,
         ]);
     }
 
